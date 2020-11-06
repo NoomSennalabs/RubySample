@@ -1,0 +1,121 @@
+# Ruby CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-ruby/ for more details
+#
+version: 2
+jobs:
+  build:
+    docker:
+      - image: circleci/ruby:2.7.0-node-browsers
+        environment:
+          RAILS_ENV: test
+          RACK_ENV: test
+          PGHOST: 127.0.0.1
+          PGUSER: circleci
+          POSTGRES_DB: ci
+          BUNDLER_VESION: 2.1.2
+
+      - image: postgres:12.4-alpine
+        environment:
+          POSTGRES_USER: circleci
+          POSTGRES_DB: ci
+          POSTGRES_PASSWORD: password
+
+      - image: circleci/redis:5.0.5-alpine
+
+    working_directory: ~/repo
+
+    steps:
+      - checkout
+
+      # gem "sennalabs-devops"
+      - add_ssh_keys:
+          fingerprints:
+            - "6f:67:2a:26:03:98:7a:91:ac:c6:8a:e0:bc:84:12:8f"
+
+      ### Yarn install ###
+      - restore_cache:
+          name: Restore Yarn Package Cache
+          keys:
+            - yarn-packages-{{ checksum "yarn.lock" }}
+      - run:
+          name: yarn install
+          command: yarn install --frozen-lockfile
+      - save_cache:
+          name: Save Yarn Package Cache
+          key: yarn-packages-{{ checksum "yarn.lock" }}
+          paths:
+            - ~/.cache/yarn
+
+      ### Bundle install ###
+      - restore_cache:
+          name: Restore Gemfile Cache
+          keys:
+            - v1-dependencies-{{ checksum "Gemfile.lock" }}
+            # fallback to using the latest cache if no exact match is found
+            - v1-dependencies-
+      - run:
+          name: Configure Bundler
+          command: |
+            echo 'export BUNDLER_VERSION=$(cat Gemfile.lock | tail -1 | tr -d " ")' >> $BASH_ENV
+            source $BASH_ENV
+            gem install bundler
+      - run:
+          name: bundle install
+          command: |
+            gem cleanup
+            gem uninstall sentry-raven --version '<=2.11.3'
+            eval `ssh-agent`
+            ssh-add -D
+            ssh-add ~/.ssh/id_rsa_*
+            bundle install --jobs=4 --retry=3 --path vendor/bundle
+      - save_cache:
+          name: Save Gemfile Cache
+          paths:
+            - ./vendor/bundle
+          key: v1-dependencies-{{ checksum "Gemfile.lock" }}
+
+      - run: cp config/application.yml.example config/application.yml
+
+      - run: cp config/database.yml.ci config/database.yml
+
+      - run:
+          name: Wait for DB
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+
+      - run:
+          name: Database setup
+          command: bundle exec rake db:migrate
+
+      - run:
+          name: standardrb
+          command: bundle exec standardrb
+
+      - run:
+          name: run unit tests
+          command: bundle exec rails test
+
+      - store_artifacts:
+          path: coverage
+
+      - store_artifacts:
+          path: tmp/screenshots
+
+      - run:
+          name: run system tests
+          command: bundle exec rails test:system
+
+      - add_ssh_keys:
+          fingerprints:
+            - "e1:a0:00:37:d6:d9:b2:50:48:30:57:25:bf:91:21:27" # Staging
+
+      - deploy:
+          name: Deploy using capistrano
+          command: |
+            if [ "${CIRCLE_BRANCH}" == "master" ]; then
+              bundle exec cap production deploy
+              exit 0
+            elif [ "${CIRCLE_BRANCH}" == "develop" ]; then
+              bundle exec cap staging deploy
+              exit 0
+            fi
